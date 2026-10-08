@@ -1,0 +1,12 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# 生成的图片与动图
+*.png
+*.gif
+
+# 其他项目与文档（非本工具代码）
+ultralytics/
+*.pdf
