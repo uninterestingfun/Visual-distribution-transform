@@ -225,9 +225,7 @@ class TransformApp:
         self.view_mode = 'animation'  # 'animation' 或 'final'
         self.density_weight = 0.0
         self.final_weight = 2.0
-        self.user_limits = None   # 用户缩放/平移后的坐标轴范围
-        self._panning = False
-        self._pan_last = None
+        self.user_limits = None   # 用户调整后的坐标轴范围
 
         self._build_ui()
         self.cmap_var.trace_add('write', self._on_cmap_change)
@@ -399,27 +397,17 @@ class TransformApp:
         self.fig.subplots_adjust(top=0.86, bottom=0.04, left=0.02, right=0.94)
         self.canvas = FigureCanvasTkAgg(self.fig, master=self.root)
         self.canvas.get_tk_widget().pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        self.canvas.mpl_connect('scroll_event', self._on_scroll)
-        self.canvas.mpl_connect('button_press_event', self._on_press)
-        self.canvas.mpl_connect('motion_notify_event', self._on_motion)
-        self.canvas.mpl_connect('button_release_event', self._on_release)
+        # 使用 matplotlib 自带的旋转/平移/缩放交互，仅在交互后捕获坐标轴范围
+        self.canvas.mpl_connect('button_release_event', self._capture_view)
+        self.canvas.mpl_connect('scroll_event', self._capture_view)
 
-    def _on_press(self, event):
-        if event.button == 2:  # 中键：使用 matplotlib 默认平移
-            self._panning = True
-
-    def _on_motion(self, event):
-        # 平移由 matplotlib 默认处理，这里不干预
-        pass
-
-    def _on_release(self, event):
-        if event.button == 2 and self._panning:
-            self._panning = False
-            # 捕获默认平移后的范围，更新刻度与 user_limits
-            xlim, ylim, zlim = self._update_ticks(
-                self.ax.get_xlim(), self.ax.get_ylim(), self.ax.get_zlim())
-            self.user_limits = (xlim, ylim, zlim)
-            self.canvas.draw_idle()
+    def _capture_view(self, event):
+        """matplotlib 默认交互（左键旋转/中键平移/右键缩放/滚轮）后，
+        捕获用户调整后的坐标轴范围并同步刻度与网格。"""
+        xlim, ylim, zlim = self._update_ticks(
+            self.ax.get_xlim(), self.ax.get_ylim(), self.ax.get_zlim())
+        self.user_limits = (xlim, ylim, zlim)
+        self.canvas.draw_idle()
 
     def _update_ticks(self, xlim, ylim, zlim):
         """根据当前坐标轴范围重新生成刻度，并把范围对齐到刻度端点，
@@ -441,30 +429,6 @@ class TransformApp:
         self.ax.set_zlim(*zlim)
         return xlim, ylim, zlim
 
-    def _on_scroll(self, event):
-        if event.button == 'up':
-            factor = 0.85
-        elif event.button == 'down':
-            factor = 1.0 / 0.85
-        else:
-            return
-
-        def scale_lim(lo, hi):
-            c = 0.5 * (lo + hi)
-            h = 0.5 * (hi - lo) * factor
-            return (c - h, c + h)
-
-        x0, x1 = self.ax.get_xlim()
-        y0, y1 = self.ax.get_ylim()
-        z0, z1 = self.ax.get_zlim()
-        self.ax.set_xlim(*scale_lim(x0, x1))
-        self.ax.set_ylim(*scale_lim(y0, y1))
-        self.ax.set_zlim(z0, z1 * factor)
-        xlim, ylim, zlim = self._update_ticks(
-            self.ax.get_xlim(), self.ax.get_ylim(), self.ax.get_zlim())
-        self.user_limits = (xlim, ylim, zlim)
-        self.canvas.draw_idle()
-
     def _setup_colorbar(self):
         from matplotlib import cm
         self.norm = Normalize(vmin=0, vmax=max(self.zmax, 1e-9))
@@ -474,6 +438,13 @@ class TransformApp:
         self.cbar = self.fig.colorbar(self.mappable, ax=self.ax,
                                       shrink=0.6, pad=0.12)
         self.cbar.set_label('概率密度')
+        self._sync_colorbar_ticks()
+
+    def _sync_colorbar_ticks(self):
+        """按当前 norm 范围设置 colorbar 的刻度与标签"""
+        ticks = self._nice_ticks(0.0, self.norm.vmax, 5)
+        self.cbar.set_ticks(ticks)
+        self.cbar.set_ticklabels([f'{v:g}' for v in ticks])
 
     # ---------------- 分布参数 ----------------
     def _on_dist_change(self, *args):
@@ -546,12 +517,10 @@ class TransformApp:
         else:
             f_p = f_cand / np.maximum(det_prod, 1e-3)
 
-        # 按最终密度选择：weight=0 时按密度值分位分层（均匀覆盖概率密度），
+        # 按最终密度选择：weight=0 时均匀采样（空间均匀覆盖），
         # weight>0 时按 f_p^weight 加权（越大越集中高密度区域）
         if weight == 0:
-            order = np.argsort(f_p)
-            sel = np.linspace(0, n_cand - 1, n_points).astype(int)
-            idx = order[sel]
+            idx = rng.integers(0, n_cand, size=n_points)
         else:
             w = f_p ** weight
             w = w / w.sum()
@@ -635,21 +604,21 @@ class TransformApp:
         ylo = all_pts[:, 1].min() - pad
         yhi = all_pts[:, 1].max() + pad
 
-        # 密度高度：连续用 99% 分位数（避免非线性发散点主导），离散质量守恒
+        # 密度高度：用实际最大密度，使 colorbar 覆盖整个采样概率密度的值域
         if self.kind == 'discrete':
             max_h = self.peak
         else:
             dens = np.concatenate(densities)
             dens = dens[np.isfinite(dens)]
             if len(dens):
-                max_h = float(np.percentile(dens, 99))
+                max_h = float(np.max(dens))
             else:
                 max_h = 1.0
             max_h = max(max_h, 1e-3)
 
         self.xticks = self._nice_ticks(xlo, xhi, 8)
         self.yticks = self._nice_ticks(ylo, yhi, 8)
-        self.zticks = self._nice_ticks(0.0, max_h * 1.15, 5)
+        self.zticks = self._nice_ticks(0.0, max_h, 5)
 
         self.xlim = (self.xticks[0], self.xticks[-1])
         self.ylim = (self.yticks[0], self.yticks[-1])
@@ -664,6 +633,7 @@ class TransformApp:
             self.norm.vmin = 0
             self.norm.vmax = self.zmax
             self.mappable.set_norm(self.norm)
+            self._sync_colorbar_ticks()
             self.cbar.draw_all()
 
         self.total_frames = max(1, len(self.transforms) * FRAMES_PER_ROUND)
@@ -1029,10 +999,10 @@ class TransformApp:
         # Z 轴动态自适应：用 99% 分位数（避免发散点主导，颜色分布合理）
         z_p_valid = z_p[np.isfinite(z_p)]
         if len(z_p_valid):
-            z_max = float(np.percentile(z_p_valid, 99))
+            z_max = float(np.max(z_p_valid))
         else:
             z_max = 1.0
-        self.zticks = self._nice_ticks(0.0, max(z_max * 1.15, 1e-3), 5)
+        self.zticks = self._nice_ticks(0.0, max(z_max, 1e-3), 5)
 
         # 坐标轴：优先使用用户缩放/平移后的范围，否则用默认
         if self.user_limits is not None:
@@ -1080,16 +1050,21 @@ class TransformApp:
         f_p = np.nan_to_num(f_p, nan=0.0, posinf=1e6, neginf=0.0)
         z_p = np.nan_to_num(z_p, nan=0.0, posinf=1e6, neginf=0.0)
 
-        # 动态颜色映射：按当前帧密度 99% 分位数设置，与 colorbar 一致
+        # 归一化密度（0~1），使颜色柱固定，仅刻度数值随当前帧变化
         f_valid = f_p[np.isfinite(f_p)]
-        vmax = float(np.percentile(f_valid, 99)) if len(f_valid) else 1.0
-        vmax = max(vmax, 1e-9)
-        norm = Normalize(vmin=0, vmax=vmax)
+        f_max = float(np.max(f_valid)) if len(f_valid) else 1.0
+        f_max = max(f_max, 1e-9)
+        f_norm = f_p / f_max
+        norm = Normalize(vmin=0.0, vmax=1.0)
         if hasattr(self, 'mappable'):
             self.mappable.set_norm(norm)
+            tick_pos = np.linspace(0.0, 1.0, 6)
+            tick_vals = tick_pos * f_max
+            self.cbar.set_ticks(tick_pos)
+            self.cbar.set_ticklabels([f'{v:g}' for v in tick_vals])
 
         sc = self.ax.scatter(xy_p[:, 0], xy_p[:, 1], z_p,
-                             c=f_p, cmap=self.cmap_var.get(),
+                             c=f_norm, cmap=self.cmap_var.get(),
                              norm=norm,
                              s=self.point_size, depthshade=True, alpha=0.85,
                              rasterized=True)
